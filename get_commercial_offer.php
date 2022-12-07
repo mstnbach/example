@@ -1,6 +1,7 @@
 <?php require($_SERVER["DOCUMENT_ROOT"] . "/bitrix/modules/main/include/prolog_before.php");
 
 use Bitrix\Iblock\ElementTable;
+use Bitrix\Main\Application;
 use Bitrix\Main\Loader;
 use PhpOffice\PhpWord\IOFactory;
 use PhpOffice\PhpWord\PhpWord;
@@ -9,19 +10,21 @@ use PhpOffice\PhpWord\SimpleType\Jc;
 use PhpOffice\PhpWord\Style\Font;
 
 $phpwordOn = include_once($_SERVER['DOCUMENT_ROOT'] . '/local/lib/vendor/autoload.php');
+if ($phpwordOn && Loader::includeModule('iblock')) {
 
-if ($phpwordOn && Loader::includeModule('iblock') && count($_GET) == 2) {
-
-    $id = $_GET['id'];
-    $blockId = $_GET['blockId'];
+    $id = $_POST['id'];
+    $blockId = $_POST['blockId'];
+    $confData = $_POST['confData'];
 
     $dbItems = ElementTable::getList(array(
         'filter' => array('IBLOCK_ID' => $blockId, 'ID' => $id)
     ));
     if ($arItem = $dbItems->fetch()) {
         $itemName = $arItem['NAME'];
-        $filename = $itemName . ".docx";
+        $fileName = $itemName . ".docx";
+
         CModule::IncludeModule("catalog");
+
         $arPrice = CPrice::GetBasePrice($id);
         $price = number_format($arPrice['PRICE'], 0, ' ', ' ');
         $detailPhotoId = $arItem['DETAIL_PICTURE'];
@@ -67,6 +70,57 @@ if ($phpwordOn && Loader::includeModule('iblock') && count($_GET) == 2) {
         $previewText = strip_tags($arItem['PREVIEW_TEXT']);
         $detailText = $arItem['DETAIL_TEXT'];
         $defaultParagraphStyle = ['spaceAfter' => \PhpOffice\PhpWord\Shared\Converter::pointToTwip(0), 'spaceBefore' => \PhpOffice\PhpWord\Shared\Converter::pointToTwip(0), 'spacing' => 0];
+
+        $confResult = [];
+
+        if (!empty($confData)) {
+
+            $confAr = json_decode($confData);
+
+            $confMaxData = [];
+            $confMaxResult = CIBlockElement::getProperty(
+                $arItem['IBLOCK_ID'],
+                $arItem['ID'],
+                [],
+                [
+                    'CODE' => 'CONFIGURATION',
+                ]
+            );
+
+            while ($confMaxResultData = $confMaxResult->Fetch()) {
+                $confValue = unserialize($confMaxResultData['VALUE']);
+                $confMaxData[$confValue['GROUP']] = $confValue['MAX_COUNT'];
+            }
+
+            foreach ($confAr as $confItem) {
+
+                $confItem = get_object_vars($confItem);
+
+                $maxCount = empty($confMaxData[$confItem['GROUP_ID']]) ? 0 : $confMaxData[$confItem['GROUP_ID']];
+
+                $quantity = $confItem['QUANTITY'] > $maxCount && $maxCount > 0 ? $maxCount : $confItem['QUANTITY'];
+
+                $confResult[$confItem['SET_PRODUCT']] = [
+                    'QUANTITY' => $quantity
+                ];
+            }
+            $confProdIds = array_keys($confResult);
+
+            $idTypePrice = CCatalogGroup::GetBaseGroup();
+
+            $prodProps = CIBlockElement::GetList(
+                [],
+                ['ID' => $confProdIds],
+                false,
+                false,
+                ['ID', 'NAME', 'CATALOG_PRICE_' . $idTypePrice['ID']]
+            );
+
+            while ($prod = $prodProps->Fetch()) {
+                $confResult[$prod['ID']]['NAME'] = $prod['NAME'];
+                $confResult[$prod['ID']]['PRICE'] = $prod['CATALOG_PRICE_' . $idTypePrice['ID']];
+            }
+        }
 
         $phpWord = new PhpWord();
         $phpWord->setDefaultFontName('Arial');
@@ -199,8 +253,35 @@ if ($phpwordOn && Loader::includeModule('iblock') && count($_GET) == 2) {
         $linkStyle = ['color' => '0000FF', 'underline' => Font::UNDERLINE_SINGLE, 'size' => 10];
 
         $section->addText('');
-		//Html::addHtml($section, $previewText, false, false);
-        $section->addText($previewText, $font10, ['align'=>'both']);
+        //Html::addHtml($section, $previewText, false, false);
+        $section->addText($previewText, $font10, ['align' => 'both']);
+
+        /*TABLE OF CONFIGURATION*/
+
+        if (!empty($confResult)) {
+
+            $section->addText('');
+            $section->addText('Позиции из конфигуратора', ['size' => 16, 'bold' => true], ['align' => 'center']);
+            $section->addText('');
+
+            $totalSum = $arPrice['PRICE'];
+
+            $confHtml = '<table cellspacing="0" cellpadding="2" border="1" align="center" ><tr><th width="60%">Товар</th><th width="20%">Количество</th><th width="20%">Цена за единицу, руб</th></tr>';
+
+            foreach ($confResult as $confItem) {
+                $totalSum += $confItem['PRICE'] * $confItem['QUANTITY'];
+                $confHtml .= '<tr align="center"><td>' . $confItem['NAME'] . '</td><td>' . $confItem['QUANTITY'] . '</td><td>' . number_format($confItem['PRICE'], 0, ' ', ' ') . '</td></tr>';
+            }
+            $confHtml .= '</table>';
+
+            Html::addHtml($section, $confHtml, false, false);
+
+            $section->addText('');
+            $section->addText('Общая стоимость: '
+                . number_format($totalSum, 0, ' ', ' ')
+                . ' руб.', ['size' => 16, 'bold' => true], ['align' => 'center']);
+            $section->addText('');
+        }
 
         /*CONTACTS*/
         $section->addText('');
@@ -219,19 +300,20 @@ if ($phpwordOn && Loader::includeModule('iblock') && count($_GET) == 2) {
 
         /*SAVE TO TMP*/
         $objWriter = IOFactory::createWriter($phpWord);
-        $temp_file_uri = tempnam('', 'xyz');
+        $root = Application::getDocumentRoot();
 
-        $objWriter->save($temp_file_uri);
+        CheckDirPath($_SERVER["DOCUMENT_ROOT"] . '/bitrix/tmp/offers');
+
+        $tempFileUri = tempnam($root . '/offers', 'offer');
+
+        $objWriter->save($tempFileUri);
+
+        $fileUri = strpos($tempFileUri, 'offers') ? str_replace($root, '', $tempFileUri) : $tempFileUri;
 
         /*GIVE TO USER*/
-        header('Content-Description: File Transfer');
-        header('Content-Type: application/octet-stream');
-        header('Content-Disposition: attachment; filename=' . $filename);
-        header('Content-Transfer-Encoding: binary');
-        header('Expires: 0');
-        header('Content-Length: ' . filesize($temp_file_uri));
-        readfile($temp_file_uri);
-        unlink($temp_file_uri); // deletes the temporary file
-        exit;
+        $fileResult['fileUri'] = $fileUri;
+        $fileResult['fileName'] = $fileName;
+
+        exit(json_encode($fileResult));
     }
 } ?>
